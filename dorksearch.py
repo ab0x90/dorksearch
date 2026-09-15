@@ -249,32 +249,85 @@ class GithubResult:
     url: str
     snippet: str = ""
 
+def _gh_rate_wait(r: requests.Response) -> int:
+    """Return seconds to wait based on rate-limit headers. 0 if not rate limited."""
+    # Prefer Retry-After (secondary rate limit), then X-RateLimit-Reset (primary)
+    retry_after = r.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(1, int(retry_after))
+        except ValueError:
+            pass
+    reset_ts = r.headers.get("X-RateLimit-Reset")
+    if reset_ts:
+        try:
+            wait = int(reset_ts) - int(time.time())
+            return max(1, wait + 2)   # +2s buffer
+        except ValueError:
+            pass
+    return 60  # safe default when headers are absent
+
 def _gh_search(query: str, token: str, max_results: int) -> list[dict]:
-    """Single GitHub code search API call. Returns raw items."""
-    headers = {
+    """Single GitHub code search API call. Waits and retries once on rate limit."""
+    req_headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.text-match+json",
     }
     params = {"q": query, "per_page": min(max_results, 100)}
-    try:
-        r = requests.get(f"{GITHUB_API}/search/code", headers=headers, params=params, timeout=15)
+
+    for attempt in range(2):   # try twice: once normally, once after waiting
+        try:
+            r = requests.get(
+                f"{GITHUB_API}/search/code",
+                headers=req_headers, params=params, timeout=15,
+            )
+        except requests.RequestException as e:
+            console.print(f"  [yellow]GitHub request error: {e}[/]")
+            return []
+
         if r.status_code == 401:
             console.print("  [red]GitHub: 401 Unauthorized — check your token[/]")
             return []
-        if r.status_code == 403:
-            reset = r.headers.get("X-RateLimit-Reset", "")
-            console.print(f"  [yellow]GitHub: rate limited (resets: {reset})[/]")
-            return []
+
+        if r.status_code in (403, 429):
+            wait = _gh_rate_wait(r)
+            remaining = r.headers.get("X-RateLimit-Remaining", "?")
+            if attempt == 0:
+                console.print(
+                    f"\n  [yellow]GitHub: rate limited (HTTP {r.status_code}, "
+                    f"remaining={remaining}) — waiting {wait}s then retrying...[/]"
+                )
+                time.sleep(wait)
+                continue   # retry
+            else:
+                console.print(
+                    f"  [red]GitHub: still rate limited after waiting — skipping query.[/]\n"
+                    f"  [dim]  Try re-running with a higher --delay or wait a few minutes.[/]"
+                )
+                return []
+
         if r.status_code == 422:
             console.print(f"  [dim]GitHub: query rejected (422) — {query[:60]}[/]")
             return []
+
         if not r.ok:
             console.print(f"  [yellow]GitHub: HTTP {r.status_code} for query: {query[:60]}[/]")
             return []
+
+        # Proactively warn if quota is running low after a successful call
+        remaining = r.headers.get("X-RateLimit-Remaining")
+        if remaining is not None and int(remaining) <= 3:
+            reset_ts = r.headers.get("X-RateLimit-Reset", "")
+            wait = _gh_rate_wait(r)
+            console.print(
+                f"\n  [yellow]GitHub: quota nearly exhausted ({remaining} remaining) "
+                f"— pausing {wait}s to let it reset...[/]"
+            )
+            time.sleep(wait)
+
         return r.json().get("items", [])
-    except requests.RequestException as e:
-        console.print(f"  [yellow]GitHub request error: {e}[/]")
-        return []
+
+    return []
 
 def _extract_snippet(item: dict) -> str:
     """Pull first text match fragment from the API response."""
