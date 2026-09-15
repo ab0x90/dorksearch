@@ -147,7 +147,6 @@ GITHUB_DOMAIN_QUERIES: list[tuple[str, str, str]] = [
     ("Twilio credentials",         "HIGH",     '"{target}" "TWILIO_ACCOUNT_SID"'),
     ("Generic secrets",            "MEDIUM",   '"{target}" secret'),
     ("Config files",               "MEDIUM",   '"{target}" filename:config.yml OR filename:config.json'),
-    ("Any mention",                "LOW",      '"{target}"'),
 ]
 
 GITHUB_ORG_QUERIES: list[tuple[str, str, str]] = [
@@ -290,17 +289,26 @@ def run_github_search(
     token: str,
     org: str,
     user: str,
+    search_terms: list[str],
     max_results: int,
     delay: float,
 ) -> list[GithubResult]:
     results: list[GithubResult] = []
-
-    # Build the query list
     query_sets: list[tuple[str, str, str]] = []
 
-    # Domain-referenced queries (search all of GitHub for mentions of target)
-    for desc, sev, template in GITHUB_DOMAIN_QUERIES:
-        query_sets.append((desc, sev, template.replace("{target}", target)))
+    # Domain-referenced queries — only run when at least one explicit search term
+    # is given. Firing the bare root domain returns too many unrelated results.
+    if search_terms:
+        for term in search_terms:
+            for desc, sev, template in GITHUB_DOMAIN_QUERIES:
+                label = f"{desc} [{term}]" if len(search_terms) > 1 else desc
+                query_sets.append((label, sev, template.replace("{target}", term)))
+    elif not org and not user:
+        # Token provided but nothing to narrow the search — warn and skip domain queries.
+        console.print(
+            "  [yellow]→ GitHub: skipping domain queries — root domain is too broad.[/]\n"
+            "  [dim]    Add --github-search \"@domain.com\" or --github-org ORG to target results.[/]\n"
+        )
 
     # Org-scoped queries
     if org:
@@ -312,8 +320,19 @@ def run_github_search(
         for desc, sev, template in GITHUB_USER_QUERIES:
             query_sets.append((desc, sev, template.replace("{scope}", user)))
 
+    if not query_sets:
+        return results
+
     total = len(query_sets)
-    console.print(f"  [dim]→ GitHub: {total} queries{' (org: ' + org + ')' if org else ''}{' (user: ' + user + ')' if user else ''}...[/]")
+    scope_parts = []
+    if search_terms:
+        scope_parts.append("terms: " + ", ".join(f'"{t}"' for t in search_terms))
+    if org:
+        scope_parts.append(f"org: {org}")
+    if user:
+        scope_parts.append(f"user: {user}")
+    console.print(f"  [dim]→ GitHub: {total} quer{'y' if total == 1 else 'ies'}"
+                  f"{' (' + ', '.join(scope_parts) + ')' if scope_parts else ''}...[/]")
 
     seen_urls: set[str] = set()
 
@@ -356,14 +375,16 @@ def _badge(sev: str) -> str:
     color = SEV_COLOR.get(sev, "white")
     return f"[{color}][{sev:8}][/]"
 
-def print_header(target: str, org: str, user: str):
+def print_header(target: str, org: str, user: str, search_terms: list[str]):
     console.print()
     console.print(Panel(BANNER, expand=False, border_style="cyan dim"))
-    console.print(f"\n  [bold]target[/] : [cyan]{target}[/]")
+    console.print(f"\n  [bold]target    [/] : [cyan]{target}[/]")
+    if search_terms:
+        console.print(f"  [bold]gh search [/] : [cyan]{', '.join(search_terms)}[/]")
     if org:
-        console.print(f"  [bold]gh org [/] : [cyan]{org}[/]")
+        console.print(f"  [bold]gh org    [/] : [cyan]{org}[/]")
     if user:
-        console.print(f"  [bold]gh user[/] : [cyan]{user}[/]")
+        console.print(f"  [bold]gh user   [/] : [cyan]{user}[/]")
     console.print()
 
 def print_google_results(results: list[Result], dorks_only: bool):
@@ -492,11 +513,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  python3 dorksearch.py example.com\n"
-            "  python3 dorksearch.py example.com --github-token ghp_xxx\n"
-            "  python3 dorksearch.py example.com --github-org acme --github-token ghp_xxx\n"
             "  python3 dorksearch.py example.com --dorks-only\n"
-            "  python3 dorksearch.py example.com --no-google --github-org acme --github-token ghp_xxx\n"
+            "  python3 dorksearch.py example.com --github-token ghp_xxx --github-search \"@example.com\"\n"
+            "  python3 dorksearch.py example.com --github-token ghp_xxx --github-org acme\n"
+            "  python3 dorksearch.py example.com --github-token ghp_xxx \\\n"
+            "      --github-search \"@example.com,acme-internal\" --github-org acme\n"
+            "  python3 dorksearch.py example.com --no-google --github-token ghp_xxx \\\n"
+            "      --github-search \"@example.com\" --github-org acme --output results.json\n"
         ),
     )
     parser.add_argument("target",
@@ -507,6 +530,13 @@ def main():
                         help="Scope GitHub search to this organization")
     parser.add_argument("--github-user", metavar="USER",
                         help="Scope GitHub search to this user")
+    parser.add_argument("--github-search", metavar="TERM[,TERM]",
+                        help="Search term(s) for GitHub domain queries — replaces the raw "
+                             "target domain. Comma-separate for multiple terms. "
+                             "Examples: \"@example.com\", \"acme-internal\", "
+                             "\"@example.com,acme-corp\". Without this flag and without "
+                             "--github-org/--github-user, domain queries are skipped "
+                             "because the bare domain returns too many unrelated results.")
     parser.add_argument("--categories", metavar="LIST",
                         help=f"Comma-separated dork categories "
                              f"(default: all). Available: {', '.join(ALL_CATEGORIES)}")
@@ -524,12 +554,18 @@ def main():
                         help="Save results to JSON file")
     args = parser.parse_args()
 
-    # Validate
+    # Validate / normalise inputs
     target = args.target.lower().strip().lstrip("https://").lstrip("http://").rstrip("/")
-    need_github = not args.no_github and (args.github_token or args.github_org or args.github_user)
+    need_github = not args.no_github and (
+        args.github_token or args.github_org or args.github_user or args.github_search
+    )
     if need_github and not args.github_token:
         console.print("[red]--github-token required for GitHub search[/]")
         sys.exit(1)
+
+    search_terms: list[str] = []
+    if args.github_search:
+        search_terms = [t.strip() for t in args.github_search.split(",") if t.strip()]
 
     categories = ALL_CATEGORIES
     if args.categories:
@@ -540,7 +576,7 @@ def main():
             console.print(f"Available: {', '.join(ALL_CATEGORIES)}")
             sys.exit(1)
 
-    print_header(target, args.github_org or "", args.github_user or "")
+    print_header(target, args.github_org or "", args.github_user or "", search_terms)
 
     console.print(Rule(" Scanning ", style="dim"))
     console.print()
@@ -563,6 +599,7 @@ def main():
             token=args.github_token,
             org=args.github_org or "",
             user=args.github_user or "",
+            search_terms=search_terms,
             max_results=args.max_results,
             delay=args.delay,
         )
